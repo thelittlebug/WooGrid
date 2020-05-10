@@ -1,15 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
-using System.Drawing;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Runtime.InteropServices;
-using System.Drawing;
+using System.IO;
 
 namespace WooGrid
 {
@@ -24,10 +20,7 @@ namespace WooGrid
             _globalKeyboardHook.KeyboardPressed += OnKeyPressed;
             notifyIcon1.Icon = this.Icon;
             settings = MySettings.Load();
-            
-            
-            //WindowPositions = new List<WindowPosition>();
-            dataGridView1.DataSource = settings.WindowPositions;
+            settings.Save();
         }
 
         private void Form1_Resize(object sender, System.EventArgs e)
@@ -50,7 +43,11 @@ namespace WooGrid
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int Width, int Height, bool Repaint);
-        
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+
+
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
@@ -58,97 +55,246 @@ namespace WooGrid
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT
         {
-            public int Left;        // x position of upper-left corner  
-            public int Top;         // y position of upper-left corner  
-            public int Right;       // x position of lower-right corner  
-            public int Bottom;      // y position of lower-right corner  
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
         }
 
-        private void MoveActiveWindow(WindowPosition position)
+        private void printRect(RECT rect)
         {
-            IntPtr handle = GetForegroundWindow();
-            MoveWindow(handle, position.Left, position.Top, position.Width, position.Height, true);
+            Debug.WriteLine($"{rect.Left} {rect.Top} {rect.Right} {rect.Bottom}");
         }
 
-        private void GetActiveWindowPosition(Keys key)
+        private RECT getWindowGrid(IntPtr handle)
         {
-            IntPtr handle = GetForegroundWindow();
             RECT pos;
             GetWindowRect(handle, out pos);
 
-            settings.WindowPositions.Add(new WindowPosition() { Key = key, Screen = 1, Top = pos.Top, Left = pos.Left, Width = pos.Right - pos.Left, Height = pos.Bottom - pos.Top });
-            // dataGridView1.DataSource = null;
-            dataGridView1.DataSource = settings.WindowPositions;
+            int grid_w = Screen.PrimaryScreen.WorkingArea.Width / 4;
+            int grid_h = Screen.PrimaryScreen.WorkingArea.Height / 4;
 
+            return new RECT() {
+                Left = Convert.ToInt32((double)pos.Left / grid_w),
+                Top = Convert.ToInt32((double)pos.Top / grid_h),
+                Right = Convert.ToInt32((double)(pos.Right - pos.Left) / grid_w),
+                Bottom = Convert.ToInt32((double)(pos.Bottom - pos.Top) / grid_h)
+            };
         }
 
-        const int WAIT_FOR_HOTKEY_1 = 0;
-        const int WAIT_FOR_HOTKEY_2 = 1;
-        const int WAIT_FOR_CMD = 2;
-        const int WAIT_FOR_KEY = 3;
-        
-        int state = WAIT_FOR_HOTKEY_1;
+        private RECT getWindowMargin(IntPtr handle)
+        {
+            RECT pos;
+            RECT margin;
+
+            GetWindowRect(handle, out pos);
+
+            const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+            DwmGetWindowAttribute(GetForegroundWindow(), DWMWA_EXTENDED_FRAME_BOUNDS, out margin, Marshal.SizeOf<RECT>());
+
+            return new RECT()
+            {
+                Left = Math.Abs(pos.Left - margin.Left),
+                Top = Math.Abs(pos.Top - margin.Top),
+                Right = Math.Abs(pos.Right - margin.Right),
+                Bottom = Math.Abs(pos.Bottom - margin.Bottom)
+            };
+        }
+
+        private void moveWindowAbsolute(RECT pos)
+        {
+            IntPtr handle = GetForegroundWindow();
+            RECT margin = getWindowMargin(handle);
+
+            int grid_w = Screen.PrimaryScreen.WorkingArea.Width / 4;
+            int grid_h = Screen.PrimaryScreen.WorkingArea.Height / 4;
+
+            MoveWindow(handle,
+                pos.Left * grid_w - margin.Left,
+                pos.Top * grid_h - margin.Top,
+                pos.Right * grid_w + margin.Left + margin.Right,
+                pos.Bottom * grid_h + margin.Top + margin.Bottom,
+                true
+            );
+        }
+
+        private void moveWindowRelative(RECT delta)
+        {
+            IntPtr handle = GetForegroundWindow();
+
+            RECT w = getWindowGrid(handle);
+            moveWindowAbsolute(new RECT() {
+                Left = w.Left + delta.Left,
+                Top = w.Top + delta.Top,
+                Right = w.Right + delta.Right,
+                Bottom = w.Bottom + delta.Bottom
+            });
+        }
+
+        const int WAIT_FOR_SHORTCUT = 0;
+        const int WAIT_FOR_CMD = 1;
+        int state = WAIT_FOR_SHORTCUT;
+        public List<Keys> PressedKeys = new List<Keys>();
 
         private void OnKeyPressed(object sender, GlobalKeyboardHookEventArgs e)
         {
-            // EDT: No need to filter for VkSnapshot anymore. This now gets handled
-            // through the constructor of GlobalKeyboardHook(...).
+            Keys loggedKey = e.KeyboardData.Key;
+
+            if (e.KeyboardState == GlobalKeyboardHook.KeyboardState.KeyUp)
+            {
+                if (PressedKeys.Contains(loggedKey))
+                {
+                    PressedKeys.Remove(loggedKey);
+                }
+            }
+
             if (e.KeyboardState == GlobalKeyboardHook.KeyboardState.KeyDown)
             {
-                Debug.WriteLine(state);
-                Keys loggedKey = e.KeyboardData.Key;
-
-                if (state == WAIT_FOR_HOTKEY_1)
+                if (state == WAIT_FOR_SHORTCUT)
                 {
-                    if (loggedKey == Keys.LWin) state = WAIT_FOR_HOTKEY_2;
-                    return;
-                }
+                    if (!PressedKeys.Contains(loggedKey))
+                    {
+                        PressedKeys.Add(loggedKey);
+                    }
 
-                if (state == WAIT_FOR_HOTKEY_2)
-                {
-                    if (loggedKey == Keys.LShiftKey) state = WAIT_FOR_CMD;
-                    return;
-                }
+                    if (settings.SC.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        state = WAIT_FOR_CMD;
+                        e.Handled = true;
+                        return;
+                    }
 
-                if (state == WAIT_FOR_KEY)
-                {
-                    GetActiveWindowPosition(loggedKey);
-                    state = WAIT_FOR_HOTKEY_1;
+                    if (settings.SC_MOVE_RIGHT.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 1, Top = 0, Right = 0, Bottom = 0 });
+                        e.Handled = true;
+                        return;
+                    }
+
+                    if (settings.SC_MOVE_LEFT.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = -1, Top = 0, Right = 0, Bottom = 0 });
+                        e.Handled = true;
+                        return;
+                    }
+
+                    if (settings.SC_MOVE_UP.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 0, Top = -1, Right = 0, Bottom = 0 });
+                        e.Handled = true;
+                        return;
+                    }
+
+                    if (settings.SC_MOVE_DOWN.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 0, Top = 1, Right = 0, Bottom = 0 });
+                        e.Handled = true;
+                        return;
+                    }
+
+                    if (settings.SC_SIZE_X_PLUS.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 0, Top = 0, Right = 1, Bottom = 0 });
+                        e.Handled = true;
+                        return;
+                    }
+                    if (settings.SC_SIZE_X_MINUS.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 0, Top = 0, Right = -1, Bottom = 0 });
+                        e.Handled = true;
+                        return;
+                    }
+                    if (settings.SC_SIZE_Y_PLUS.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 0, Top = 0, Right = 0, Bottom = 1 });
+                        e.Handled = true;
+                        return;
+                    }
+                    if (settings.SC_SIZE_Y_MINUS.OrderBy(m => m).SequenceEqual(PressedKeys.OrderBy(m => m)))
+                    {
+                        moveWindowRelative(new RECT() { Left = 0, Top = 0, Right = 0, Bottom = -1 });
+                        e.Handled = true;
+                        return;
+                    }
                     return;
                 }
 
                 if (state == WAIT_FOR_CMD)
                 {
-                    if (loggedKey == Keys.L)
-                    {
-                        state = WAIT_FOR_KEY;
-                        return;
-                    }
-                    
                     foreach (var position in settings.WindowPositions)
                     {
                         if (loggedKey == position.Key)
                         {
-                            MoveActiveWindow(position);
-                            state = WAIT_FOR_HOTKEY_1;
+                            moveWindowAbsolute(new RECT() {
+                                Left = position.Left,
+                                Top = position.Top,
+                                Right = position.Right,
+                                Bottom = position.Bottom
+                            });
+                            state = WAIT_FOR_SHORTCUT;
+                            e.Handled = true;
                             return;
                         }
                     }
                     return;
                 }
-                Debug.WriteLine(state);
             }
         }
 
         class MySettings : AppSettings<MySettings>
         {
             public int version = 0;
-            public List<WindowPosition> WindowPositions = new  List<WindowPosition>();
+            public List<Keys> SC = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.Y };
+            public List<Keys> SC_MOVE_RIGHT = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.A, Keys.Right };
+            public List<Keys> SC_MOVE_LEFT = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.A, Keys.Left };
+            public List<Keys> SC_MOVE_UP = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.A, Keys.Up };
+            public List<Keys> SC_MOVE_DOWN = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.A, Keys.Down };
+            public List<Keys> SC_SIZE_X_PLUS = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.S, Keys.Right };
+            public List<Keys> SC_SIZE_X_MINUS = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.S, Keys.Left };
+            public List<Keys> SC_SIZE_Y_PLUS = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.S, Keys.Down };
+            public List<Keys> SC_SIZE_Y_MINUS = new List<Keys>() { Keys.LControlKey, Keys.LShiftKey, Keys.S, Keys.Up };
+            public List<WindowPosition> WindowPositions = new List<WindowPosition>() {
+                new WindowPosition() {
+                    Key = Keys.F1,
+                    Left = 0,
+                    Top = 0,
+                    Right = 2,
+                    Bottom = 2
+                },
+                new WindowPosition() {
+                    Key = Keys.F2,
+                    Left = 2,
+                    Top = 0,
+                    Right = 4,
+                    Bottom = 2
+                },
+                new WindowPosition() {
+                    Key = Keys.F3,
+                    Left = 0,
+                    Top = 2,
+                    Right = 2,
+                    Bottom = 4
+                },
+                new WindowPosition() {
+                    Key = Keys.F4,
+                    Left = 2,
+                    Top = 2,
+                    Right = 4,
+                    Bottom = 4
+                }
+            };
         }
 
-        private void button1_Click(object sender, EventArgs e)
+        private void button3_Click(object sender, EventArgs e)
         {
-            settings.Save();
+            var curDir = Directory.GetCurrentDirectory();
+            var file = $@"{curDir}\settings.json";
+            Process.Start("notepad.exe", file);
+        }
+
+        private void button4_Click(object sender, EventArgs e)
+        {
+            settings = MySettings.Load();
         }
     }
 }
